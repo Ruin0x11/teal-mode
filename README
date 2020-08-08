@@ -1,0 +1,13 @@
+teal-mode
+========
+
+Maintainer: Ruin0x11 <ipickering2@gmail.com>
+
+tl-mode is an Emacs major mode for editing Teal files. For
+documentation, including installation instructions, please see
+tl-mode.el.
+
+Please send bug reports and suggestions to the maintainer, or use the
+trackers at github:
+
+http://github.com/Ruin0x11/tl-mode
