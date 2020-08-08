@@ -137,7 +137,8 @@
            (teal-keyword
             (symbol "and" "break" "do" "else" "elseif" "end"  "for" "function"
                     "goto" "if" "in" "local" "not" "or" "repeat" "return"
-                    "then" "until" "while"))))
+                    "then" "until" "while"
+                    "record" "enum" "functiontype"))))
 
         (defmacro teal-rx (&rest regexps)
           (eval `(rx-let ,teal--rx-bindings
@@ -200,14 +201,19 @@ element is itself expanded with `teal-rx-to-string'. "
             `((symbol teal--rx-symbol 1 nil)
               (ws . "[ \t]*") (ws+ . "[ \t]+")
               (teal-name :rx (symbol (regexp "[[:alpha:]_]+[[:alnum:]_]*")))
+              (teal-typeargs :rx (seq "<" (+ teal-name (opt ",")) ">"))
+              (teal-typename :rx (or teal-name (seq teal-name teal-typeargs)))
+              (teal-type :rx (or (seq "{" (group-n 1 teal-typename (opt ":" teal-typename)) "}")
+                                 (seq "(" (* teal-typename (opt ",")) ")")
+                                 teal-typename))
               (teal-funcname
-               :rx (seq teal-name (* ws "." ws teal-name)
-                        (opt ws ":" ws teal-name)))
+               :rx (seq teal-name (* ws "." ws teal-name)))
               (teal-funcheader
                ;; Outer (seq ...) is here to shy-group the definition
                :rx (seq (or (seq (symbol "function") ws (group-n 1 teal-funcname))
                             (seq (group-n 1 teal-funcname) ws "=" ws
                                  (symbol "function")))))
+              (teal-funcargs :rx (seq "(" (* (seq teal-name (opt ":" ws teal-type) (opt ","))) ")"))
               (teal-number
                :rx (seq (or (seq (+ digit) (opt ".") (* digit))
                             (seq (* digit) (opt ".") (+ digit)))
@@ -220,8 +226,9 @@ element is itself expanded with `teal-rx-to-string'. "
               (teal-keyword
                :rx (symbol "and" "break" "do" "else" "elseif" "end"  "for" "function"
                            "goto" "if" "in" "local" "not" "or" "repeat" "return"
-                           "then" "until" "while")))
-            ))))
+                           "then" "until" "while"
+                           "record" "enum" "functiontype"))))
+      )))
 
 
 ;; Local variables
@@ -235,6 +242,13 @@ element is itself expanded with `teal-rx-to-string'. "
   :type 'integer
   :group 'teal
   :safe #'integerp)
+
+(defcustom teal-indent-start-of-block t
+  "If non-nil, indent blocks at the start of the line containing
+the block, instead of the position of the block start keyword in
+the middle of the line."
+  :type 'boolean
+  :group 'teal)
 
 (defcustom teal-comment-start "-- "
   "Default value of `comment-start'."
@@ -608,6 +622,35 @@ Groups 6-9 can be used in any of argument regexps."
                 (re-search-forward "\\(?1:\\(?2:[^ \t]+\\)\\)" parse-stop 'skip)
                 (prog1 nil (goto-char end)))))))))
 
+(defun teal-end-of-function-args-position (&rest args)
+  (save-excursion
+    (condition-case nil
+        (progn
+          ;; assume looking at "("
+          (forward-sexp)
+          (backward-char 1)
+          (point))
+      (error (point)))))
+
+(defun teal-match-function-args (end)
+  (if (looking-at-p ")")
+      nil
+    (or (re-search-forward (teal-rx (group-n 1 teal-name) ":" ws (group-n 2 teal-type)) end t)
+        (re-search-forward (teal-rx (group-n 2 teal-type)) end t)
+        (prog1 nil (goto-char end)))))
+
+(defun teal-match-type-annotation (end)
+  (message "matchty %d %d" (point) end)
+  (if (looking-at-p ",")
+      (progn
+        (re-search-forward (teal-rx teal-type) end t)
+        (teal-match-type-annotation end))
+    (progn
+      (backward-char 1)
+      (if (looking-at-p ":")
+          ;; TODO handle array/tuple types (" [{(]")
+          (re-search-forward (teal-rx teal-type) end t)
+        (forward-char 1)))))
 
 (defvar teal-font-lock-keywords
   `(;; highlight the hash-bang line "#!/foo/bar/teal" as comment
@@ -631,17 +674,16 @@ Groups 6-9 can be used in any of argument regexps."
     (,(teal-rx (symbol (seq "goto" ws+ (group-n 1 teal-name))))
       (1 font-lock-constant-face))
 
-    ;; Highlight Teal builtin functions and variables
-    (,teal--builtins
-     (1 font-lock-builtin-face) (2 font-lock-builtin-face nil noerror))
-
     ("^[ \t]*\\_<for\\_>"
      (,(teal-make-delimited-matcher (teal-rx teal-name) ","
                                    (teal-rx (or (symbol "in") teal-assignment-op)))
       nil nil
       (1 font-lock-variable-name-face nil noerror)
-      (2 font-lock-warning-face t noerror)
-      (3 font-lock-warning-face t noerror)))
+      (2 compilation-error-face t noerror)
+      (3 compilation-error-face t noerror)))
+
+    (,(teal-rx bol ws "{" (group-n 1 teal-name) "}" eol)
+     (1 font-lock-type-face nil noerror))
 
     ;; Handle local variable/function names
     ;;  local blalba, xyzzy =
@@ -651,8 +693,12 @@ Groups 6-9 can be used in any of argument regexps."
     ;;                 ^^^^^^
     ;;  local foobar = function(x,y,z)
     ;;        ^^^^^^
-    ("^[ \t]*\\_<local\\_>"
+    (,(teal-rx bol ws (symbol "local"))
      (0 font-lock-keyword-face)
+
+     (,(teal-rx (group-n 1 teal-name) ws teal-assignment-op ws (symbol "enum" "record" "functiontype"))
+      nil nil
+      (1 font-lock-type-face nil noerror))
 
      ;; (* nonl) at the end is to consume trailing characters or otherwise they
      ;; delimited matcher would attempt to parse them afterwards and wrongly
@@ -662,14 +708,39 @@ Groups 6-9 can be used in any of argument regexps."
       (1 font-lock-function-name-face nil noerror))
 
      (,(teal-make-delimited-matcher (teal-rx teal-name) ","
-                                   (teal-rx teal-assignment-op))
+                                    (teal-rx (or teal-assignment-op ":")))
       nil nil
-      (1 font-lock-variable-name-face nil noerror)
-      (2 font-lock-warning-face t noerror)
-      (3 font-lock-warning-face t noerror)))
+      (1 font-lock-variable-name-face nil noerror))
+
+     (teal-match-type-annotation
+      nil nil
+      (0 font-lock-type-face nil noerror)))
 
     (,(teal-rx (or bol ";") ws teal-funcheader)
      (1 font-lock-function-name-face))
+
+    (,(teal-rx teal-funcheader)
+     (teal-match-function-args
+      (teal-end-of-function-args-position)
+      nil
+      (1 font-lock-variable-name-face nil noerror)
+      (2 font-lock-type-face nil noerror))
+
+     ;; TODO separated matcher
+     (,(teal-rx ":" ws (group-n 1 (* nonl)))
+      nil nil
+      (1 font-lock-type-face nil noerror)))
+
+    (,(teal-rx bol ws (group-n 1 teal-name) ":" ws)
+     (1 font-lock-variable-name-face nil noerror)
+
+     (,(teal-rx teal-type)
+      nil nil
+      (0 font-lock-type-face nil noerror)))
+
+    ;; Highlight Teal builtin functions and variables
+    (,teal--builtins
+     (1 font-lock-builtin-face) (2 font-lock-builtin-face nil noerror))
 
     (,(teal-rx (or (group-n 1
                            "@" (symbol "author" "copyright" "field" "release"
@@ -683,13 +754,17 @@ Groups 6-9 can be used in any of argument regexps."
 
 (defvar teal-imenu-generic-expression
   `(("Requires" ,(teal-rx (or bol ";") ws (opt (seq (symbol "local") ws)) (group-n 1 teal-name) ws "=" ws (symbol "require")) 1)
+    ("Records" ,(teal-rx (or bol ";") ws (opt (seq (symbol "local") ws)) (group-n 1 teal-name) ws "=" ws (symbol "record")) 1)
+    ("Enums" ,(teal-rx (or bol ";") ws (opt (seq (symbol "local") ws)) (group-n 1 teal-name) ws "=" ws (symbol "enum")) 1)
     (nil ,(teal-rx (or bol ";") ws (opt (seq (symbol "local") ws)) teal-funcheader) 1))
   "Imenu generic expression for teal-mode.  See `imenu-generic-expression'.")
 
 (defvar teal-sexp-alist '(("then" . "end")
-                      ("function" . "end")
-                      ("do" . "end")
-                      ("repeat" . "until")))
+                          ("function" . "end")
+                          ("do" . "end")
+                          ("repeat" . "until")
+                          ("record" . "end")
+                          ("enum" . "end")))
 
 (defvar teal-mode-abbrev-table nil
   "Abbreviation table used in teal-mode buffers.")
@@ -735,6 +810,7 @@ Groups 6-9 can be used in any of argument regexps."
                                         nil                    ;; syntax-alist
                                         nil                    ;; syntax-begin
                                         ))
+  (setq-local font-lock-multiline t)
 
   (setq-local syntax-propertize-function
               'teal--propertize-multiline-bounds)
@@ -782,7 +858,7 @@ Groups 6-9 can be used in any of argument regexps."
 
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("\\.teal\\'" . teal-mode))
+(add-to-list 'auto-mode-alist '("\\.tl\\'" . teal-mode))
 
 ;;;###autoload
 (add-to-list 'interpreter-mode-alist '("teal" . teal-mode))
@@ -1012,28 +1088,32 @@ ignored, nil otherwise."
     (concat
      "\\(\\_<"
      (regexp-opt '("do" "function" "repeat" "then"
-                   "else" "elseif" "end" "until") t)
+                   "else" "elseif" "end" "until"
+                   "record" "enum") t)
      "\\_>\\)\\|"
      (regexp-opt '("{" "(" "[" "]" ")" "}") t))))
 
 (defconst teal-block-token-alist
-  '(("do"       "\\_<end\\_>"   "\\_<for\\|while\\_>"                       middle-or-open)
-    ("function" "\\_<end\\_>"   nil                                       open)
-    ("repeat"   "\\_<until\\_>" nil                                       open)
-    ("then"     "\\_<\\(e\\(lse\\(if\\)?\\|nd\\)\\)\\_>" "\\_<\\(else\\)?if\\_>" middle)
-    ("{"        "}"           nil                                       open)
-    ("["        "]"           nil                                       open)
-    ("("        ")"           nil                                       open)
-    ("if"       "\\_<then\\_>"  nil                                       open)
-    ("for"      "\\_<do\\_>"    nil                                       open)
-    ("while"    "\\_<do\\_>"    nil                                       open)
-    ("else"     "\\_<end\\_>"   "\\_<then\\_>"                              middle)
-    ("elseif"   "\\_<then\\_>"  "\\_<then\\_>"                              middle)
-    ("end"      nil           "\\_<\\(do\\|function\\|then\\|else\\)\\_>" close)
-    ("until"    nil           "\\_<repeat\\_>"                            close)
-    ("}"        nil           "{"                                       close)
-    ("]"        nil           "\\["                                     close)
-    (")"        nil           "("                                       close))
+  '(("do"       "\\_<end\\_>"                            "\\_<for\\|while\\_>"    middle-or-open)
+    ("function" "\\_<end\\_>"                            nil                      open)
+    ("repeat"   "\\_<until\\_>"                          nil                      open)
+    ("then"     "\\_<\\(e\\(lse\\(if\\)?\\|nd\\)\\)\\_>" "\\_<\\(else\\)?if\\_>"  middle)
+    ("{"        "}"                                      nil                      open)
+    ("["        "]"                                      nil                      open)
+    ("("        ")"                                      nil                      open)
+    ("if"       "\\_<then\\_>"                           nil                      open)
+    ("for"      "\\_<do\\_>"                             nil                      open)
+    ("while"    "\\_<do\\_>"                             nil                      open)
+    ("else"     "\\_<end\\_>"                            "\\_<then\\_>"           middle)
+    ("elseif"   "\\_<then\\_>"                           "\\_<then\\_>"           middle)
+    ("end"      nil                                      "\\_<\\(do\\|function\\|then\\|else\\|record\\|enum\\)\\_>"  close)
+    ("local"    "\\_<end\\_>"                            nil                      open)
+    ("until"    nil                                      "\\_<repeat\\_>"         close)
+    ("record"   "\\_<end\\_>"                            nil                      open)
+    ("enum"     "\\_<end\\_>"                            nil                      open)
+    ("}"        nil                                      "{"                      close)
+    ("]"        nil                                      "\\["                    close)
+    (")"        nil                                      "("                      close))
   "This is a list of block token information blocks.
 Each token information entry is of the form:
   KEYWORD FORWARD-MATCH-REGEXP BACKWARDS-MATCH-REGEXP TOKEN-TYPE
@@ -1048,7 +1128,13 @@ TOKEN-TYPE determines where the token occurs on a statement. open indicates that
   ;; else is, to be shifted to the left.
   (concat
    "\\(\\_<"
-   (regexp-opt '("do" "function" "repeat" "then" "if" "else" "elseif" "for" "while") t)
+   ;; TODO: In Teal, "function" might not start a block if it's part of a type
+   ;; annotation, so this code will not get indented correctly:
+   ;;
+   ;; local func_a: function(): number
+   ;; local func_b: function(): number
+   ;;
+   (regexp-opt '("do" "function" "repeat" "then" "if" "else" "elseif" "for" "while" "record" "enum") t)
    "\\_>\\|"
    (regexp-opt '("{" "(" "["))
    "\\)\\|\\(\\_<"
@@ -1142,7 +1228,13 @@ DIRECTION has to be either 'forward or 'backward."
               ;; if it is a not a middle kind, report the location
               (when (not (or (eq found-type 'middle)
                              (eq found-type 'middle-or-open)))
-                (throw 'found found-pos))
+                (let ((pos (if teal-indent-start-of-block
+                               (save-excursion
+                                 (goto-char found-pos)
+                                 (back-to-indentation)
+                                 (point))
+                             found-pos)))
+                  (throw 'found pos)))
               ;; if it is a middle-or-open type, record location, but keep searching.
               ;; If we fail to complete the search, we'll report the location
               (when (eq found-type 'middle-or-open)
@@ -1278,7 +1370,7 @@ previous one even though it looked like an end-of-statement.")
     (concat
      "\\(\\_<"
      (regexp-opt '("do" "while" "repeat" "until" "if" "then"
-                   "else" "elseif" "end" "for" "local") t)
+                   "else" "elseif" "end" "for" "local" "record" "enum") t)
      "\\_>\\)")))
 
 (defun teal-first-token-starts-block-p ()
@@ -1691,7 +1783,7 @@ This function just searches for a `end' at the beginning of a line."
   (mapconcat
    'identity
    '("local loadstring = loadstring or load"
-     "function luamode_loadstring(str, displayname, lineoffset)"
+     "function tealmode_loadstring(str, displayname, lineoffset)"
      "  if lineoffset > 1 then"
      "    str = string.rep('\\n', lineoffset - 1) .. str"
      "  end"
@@ -1844,7 +1936,7 @@ Otherwise, return START."
          (command
           ;; Print empty line before executing the code so that the first line
           ;; of output doesn't end up on the same line as current prompt.
-          (format "print(''); luamode_loadstring(%s, %s, %s);\n"
+          (format "print(''); tealmode_loadstring(%s, %s, %s);\n"
                   (teal-make-teal-string region-str)
                   (teal-make-teal-string teal-file)
                   lineno)))
