@@ -95,6 +95,7 @@
 (eval-when-compile
   (require 'cl-lib))
 
+(require 'lua-mode)
 (require 'comint)
 (require 'newcomment)
 (require 'rx)
@@ -260,7 +261,7 @@ the middle of the line."
   :type 'string
   :group 'teal)
 
-(defcustom teal-default-application "teal"
+(defcustom teal-default-application "tl"
   "Default application to run in Teal process."
   :type '(choice (string)
                  (cons string integer))
@@ -682,7 +683,7 @@ Groups 6-9 can be used in any of argument regexps."
       (2 compilation-error-face t noerror)
       (3 compilation-error-face t noerror)))
 
-    (,(teal-rx bol ws "{" (group-n 1 teal-name) "}" eol)
+    (,(teal-rx (or bol ";") ws "{" (group-n 1 teal-name) "}" eol)
      (1 font-lock-type-face nil noerror))
 
     ;; Handle local variable/function names
@@ -693,7 +694,7 @@ Groups 6-9 can be used in any of argument regexps."
     ;;                 ^^^^^^
     ;;  local foobar = function(x,y,z)
     ;;        ^^^^^^
-    (,(teal-rx bol ws (symbol "local"))
+    (,(teal-rx (or bol ";") ws (symbol "local"))
      (0 font-lock-keyword-face)
 
      (,(teal-rx (group-n 1 teal-name) ws teal-assignment-op ws (symbol "enum" "record" "functiontype"))
@@ -731,7 +732,7 @@ Groups 6-9 can be used in any of argument regexps."
       nil nil
       (1 font-lock-type-face nil noerror)))
 
-    (,(teal-rx bol ws (group-n 1 teal-name) ":" ws)
+    (,(teal-rx (or bol ";") ws (group-n 1 teal-name) ":" ws)
      (1 font-lock-variable-name-face nil noerror)
 
      (,(teal-rx teal-type)
@@ -2027,6 +2028,47 @@ left out."
           ;; perform the normal forward-sexp.
           (forward-sexp 1))
         (setq count (1- count))))))
+
+(defun teal-compile-to-lua ()
+  "Compiles the current Teal file to Lua."
+  (interactive)
+  (let ((file-name (buffer-file-name)))
+    (with-temp-buffer
+      (apply 'call-process teal-default-application
+             nil (current-buffer) nil
+             (list "gen" file-name))
+      (message (string-trim (buffer-string))))))
+
+(defconst teal-compile-and-print-code
+  (mapconcat
+   'identity
+   '("local tl = require('tl')"
+     "local filename = arg[1]"
+     "local env = tl.init_env(true)"
+     "local result, err = tl.process(filename, env, nil, {})"
+     "if err then"
+     "  error(err)"
+     "end"
+     "print(tl.pretty_print_ast(result.ast))"
+     )
+   " "))
+
+(defun teal-compile-to-lua-and-show ()
+  "Compiles the current Teal file to Lua and opens the output in
+a new buffer for inspection."
+  (interactive)
+  (let ((buffer (get-buffer-create "*teal-gen-output*"))
+        (file-name (buffer-file-name)))
+    (with-current-buffer buffer
+      (erase-buffer)
+      (apply 'call-process-region teal-compile-and-print-code nil
+             lua-default-application
+             nil (current-buffer) nil
+             (list "-" file-name))
+      (lua-mode)
+      (goto-char (point-min)))
+    (pop-to-buffer buffer)
+    (message "Compilation finished.")))
 
 
 ;; menu bar
